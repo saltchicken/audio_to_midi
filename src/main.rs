@@ -87,7 +87,7 @@ fn main() {
         };
 
         if packet.track_id() != track_id {
-            continue; // Skip packets belonging to other tracks (e.g. video/metadata)
+            continue; // Skip packets belonging to other tracks
         }
 
         match decoder.decode(&packet) {
@@ -115,7 +115,6 @@ fn main() {
                 }
             }
             Err(Error::DecodeError(e)) => {
-                // A recoverable decode error (e.g., dropped frame)
                 eprintln!("Decode error: {}", e);
             }
             Err(e) => {
@@ -151,11 +150,21 @@ fn main() {
     for i in (0..filtered_samples.len().saturating_sub(window_size)).step_by(hop_size) {
         let window = &filtered_samples[i..i + window_size];
         
-        // threshold 0.15, certainty 0.20 are standard gating limits
-        if let Some(pitch) = detector.get_pitch(&window, sample_rate as usize, 0.15, 0.20) {
-            raw_pitches.push((i, hz_to_midi(pitch.frequency)));
+        // 1. Calculate RMS (Volume) to gate out background noise and reverb tails
+        let mut rms = 0.0;
+        for &s in window { rms += s * s; }
+        rms = (rms / window.len() as f64).sqrt();
+
+        // 2. Only run pitch detection if the audio is loud enough
+        let volume_threshold = 0.015; // Roughly -36dB. Adjust if quiet notes get cut off.
+        if rms > volume_threshold {
+            if let Some(pitch) = detector.get_pitch(&window, sample_rate as usize, 0.15, 0.20) {
+                raw_pitches.push((i, hz_to_midi(pitch.frequency), rms));
+            } else {
+                raw_pitches.push((i, 0.0, rms));
+            }
         } else {
-            raw_pitches.push((i, 0.0));
+            raw_pitches.push((i, 0.0, rms)); // Silence
         }
     }
 
@@ -166,24 +175,50 @@ fn main() {
     for i in 0..raw_pitches.len() {
         let start = i.saturating_sub(median_window / 2);
         let end = (i + median_window / 2).min(raw_pitches.len() - 1);
-        let mut window: Vec<f64> = raw_pitches[start..=end].iter().map(|&(_, p)| p).collect();
         
-        window.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let median_val = window[window.len() / 2];
-        smoothed_pitches.push((raw_pitches[i].0, median_val));
+        // Median smooth pitch
+        let mut window_p: Vec<f64> = raw_pitches[start..=end].iter().map(|&(_, p, _)| p).collect();
+        window_p.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median_pitch = window_p[window_p.len() / 2];
+
+        // Median smooth RMS
+        let mut window_rms: Vec<f64> = raw_pitches[start..=end].iter().map(|&(_, _, r)| r).collect();
+        window_rms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median_rms = window_rms[window_rms.len() / 2];
+
+        smoothed_pitches.push((raw_pitches[i].0, median_pitch, median_rms));
     }
 
-    println!("Segmenting Notes with Hysteresis (Debouncing)...");
-    let min_stable_frames = 6; // Pitch must hold steady for ~70ms to register
+    println!("Quantizing with Hysteresis (Debouncing boundaries)...");
+    let mut quantized_pitches = Vec::new();
+    let mut current_quantized = 0u8;
+
+    for &(frame_idx, midi_float, rms) in &smoothed_pitches {
+        let q = if midi_float > 0.0 {
+            // Hysteresis: Require a >0.6 semitone change to switch notes.
+            // This stops vibrato from flipping back and forth between C and C#.
+            if current_quantized > 0 && (midi_float - current_quantized as f64).abs() < 0.6 {
+                current_quantized
+            } else {
+                midi_float.round() as u8
+            }
+        } else {
+            0
+        };
+        current_quantized = q;
+        quantized_pitches.push((frame_idx, q, rms));
+    }
+
+    println!("Segmenting Notes...");
+    let min_stable_frames = 5; 
     let mut midi_events = Vec::new();
     
-    let mut current_note: Option<(u8, usize)> = None;
+    // Tracks: (pitch, start_frame, peak_volume)
+    let mut current_note: Option<(u8, usize, f64)> = None; 
     let mut candidate_note = 0u8;
     let mut candidate_count = 0;
 
-    for &(frame_idx, midi_float) in &smoothed_pitches {
-        let pitch = if midi_float > 0.0 { midi_float.round() as u8 } else { 0 };
-
+    for &(frame_idx, pitch, rms) in &quantized_pitches {
         if pitch == candidate_note {
             candidate_count += 1;
         } else {
@@ -191,35 +226,41 @@ fn main() {
             candidate_count = 1;
         }
 
-        // Once a pitch holds for `min_stable_frames`, lock it in.
         if candidate_count == min_stable_frames {
             let actual_start_frame = frame_idx.saturating_sub(min_stable_frames * hop_size);
 
             match current_note {
-                Some((curr_pitch, start_frame)) => {
+                Some((curr_pitch, start_frame, curr_rms)) => {
                     if curr_pitch != candidate_note {
                         if curr_pitch != 0 {
-                            midi_events.push((curr_pitch, start_frame, actual_start_frame));
+                            midi_events.push((curr_pitch, start_frame, actual_start_frame, curr_rms));
                         }
                         if candidate_note != 0 {
-                            current_note = Some((candidate_note, actual_start_frame));
+                            current_note = Some((candidate_note, actual_start_frame, rms));
                         } else {
-                            current_note = None; // Transitioned to silence
+                            current_note = None;
                         }
+                    } else {
+                        // Maintain the peak volume for the currently held note
+                        current_note = Some((curr_pitch, start_frame, curr_rms.max(rms)));
                     }
                 }
                 None => {
                     if candidate_note != 0 {
-                        current_note = Some((candidate_note, actual_start_frame));
+                        current_note = Some((candidate_note, actual_start_frame, rms));
                     }
                 }
+            }
+        } else if let Some((curr_pitch, start_frame, curr_rms)) = current_note {
+            // Track peak volume while holding the note
+            if curr_pitch == pitch {
+                current_note = Some((curr_pitch, start_frame, curr_rms.max(rms)));
             }
         }
     }
 
-    // Flush any lingering note at the end of the file
-    if let Some((curr_pitch, start_frame)) = current_note {
-        midi_events.push((curr_pitch, start_frame, filtered_samples.len()));
+    if let Some((curr_pitch, start_frame, curr_rms)) = current_note {
+        midi_events.push((curr_pitch, start_frame, filtered_samples.len(), curr_rms));
     }
 
     println!("Writing MIDI file...");
@@ -227,9 +268,13 @@ fn main() {
     let mut track = Track::new();
     let mut last_tick = 0;
 
-    for (pitch, start_frame, end_frame) in midi_events {
+    for (pitch, start_frame, end_frame, max_rms) in midi_events {
         let start_tick = frame_to_tick(start_frame, sample_rate);
         let end_tick = frame_to_tick(end_frame, sample_rate);
+
+        // Map max_rms to MIDI velocity (0 - 127) to give the performance dynamics
+        let vel_f = (max_rms.sqrt() * 300.0).clamp(30.0, 127.0);
+        let velocity = vel_f as u8;
 
         let delta_on = start_tick.saturating_sub(last_tick);
         track.push(TrackEvent {
@@ -238,7 +283,7 @@ fn main() {
                 channel: 0.into(),
                 message: MidiMessage::NoteOn { 
                     key: u7::from(pitch), 
-                    vel: u7::from(100) 
+                    vel: u7::from(velocity) 
                 }
             }
         });
