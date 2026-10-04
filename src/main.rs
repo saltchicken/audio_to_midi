@@ -3,6 +3,8 @@ use biquad::{Biquad, Coefficients, DirectForm2Transposed, ToHertz, Type, Q_BUTTE
 use pitch_detection::detector::yin::YINDetector;
 use pitch_detection::detector::PitchDetector;
 use midly::{Header, Format, Timing, Track, TrackEvent, TrackEventKind, MidiMessage, Smf, MetaMessage, num::u7};
+use std::env;
+use std::path::Path;
 
 fn hz_to_midi(hz: f64) -> f64 {
     69.0 + 12.0 * (hz / 440.0).log2()
@@ -15,8 +17,19 @@ fn frame_to_tick(frame: usize, sample_rate: u32) -> u32 {
 }
 
 fn main() {
-    println!("Loading audio...");
-    let mut reader = hound::WavReader::open("chant.wav").expect("Failed to open chant.wav");
+    let args: Vec<String> = env::args().collect();
+    if args.len() != 2 {
+        eprintln!("Usage: {} <input_audio.wav>", args[0]);
+        std::process::exit(1);
+    }
+    
+    let input_path = &args[1];
+    let output_path = Path::new(input_path).with_extension("mid");
+
+    println!("Loading audio from {}...", input_path);
+    let mut reader = hound::WavReader::open(input_path)
+        .unwrap_or_else(|_| panic!("Failed to open {}", input_path));
+        
     let spec = reader.spec();
     let sample_rate = spec.sample_rate;
     
@@ -168,7 +181,8 @@ fn main() {
         kind: TrackEventKind::Meta(MetaMessage::EndOfTrack)
     });
 
-    let smf = Smf::new(header, vec![track]);
-    smf.save("chant_output.mid").unwrap();
-    println!("Done! Saved to chant_output.mid");
+    let mut smf = Smf::new(header);
+    smf.tracks.push(track);
+    smf.save(&output_path).unwrap();
+    println!("Done! Saved to {}", output_path.display());
 }
