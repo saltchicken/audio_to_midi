@@ -1,10 +1,18 @@
-use hound;
 use biquad::{Biquad, Coefficients, DirectForm2Transposed, ToHertz, Type, Q_BUTTERWORTH_F32};
 use pitch_detection::detector::yin::YINDetector;
 use pitch_detection::detector::PitchDetector;
 use midly::{Header, Format, Timing, Track, TrackEvent, TrackEventKind, MidiMessage, Smf, MetaMessage, num::u7};
 use std::env;
 use std::path::Path;
+use std::fs::File;
+
+use symphonia::core::audio::SampleBuffer;
+use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
+use symphonia::core::errors::Error;
+use symphonia::core::formats::FormatOptions;
+use symphonia::core::io::MediaSourceStream;
+use symphonia::core::meta::MetadataOptions;
+use symphonia::core::probe::Hint;
 
 fn hz_to_midi(hz: f64) -> f64 {
     69.0 + 12.0 * (hz / 440.0).log2()
@@ -19,7 +27,7 @@ fn frame_to_tick(frame: usize, sample_rate: u32) -> u32 {
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() != 2 {
-        eprintln!("Usage: {} <input_audio.wav>", args[0]);
+        eprintln!("Usage: {} <input_audio_file>", args[0]);
         std::process::exit(1);
     }
     
@@ -27,21 +35,95 @@ fn main() {
     let output_path = Path::new(input_path).with_extension("mid");
 
     println!("Loading audio from {}...", input_path);
-    let mut reader = hound::WavReader::open(input_path)
-        .unwrap_or_else(|_| panic!("Failed to open {}", input_path));
-        
-    let spec = reader.spec();
-    let sample_rate = spec.sample_rate;
     
-    // Normalize audio to f32 for filtering
-    let samples: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Int => reader.samples::<i16>()
-            .map(|s| s.unwrap() as f32 / i16::MAX as f32)
-            .collect(),
-        hound::SampleFormat::Float => reader.samples::<f32>()
-            .map(|s| s.unwrap())
-            .collect(),
-    };
+    // 1. Open the media source.
+    let file = Box::new(File::open(input_path).expect("Failed to open audio file"));
+    let mss = MediaSourceStream::new(file, Default::default());
+
+    // 2. Setup format hints based on file extension
+    let mut hint = Hint::new();
+    if let Some(ext) = Path::new(input_path).extension().and_then(|s| s.to_str()) {
+        hint.with_extension(ext);
+    }
+
+    // 3. Probe the media source to determine the format.
+    let meta_opts: MetadataOptions = Default::default();
+    let fmt_opts: FormatOptions = Default::default();
+    let probed = symphonia::default::get_probe()
+        .format(&hint, mss, &fmt_opts, &meta_opts)
+        .expect("Unsupported or unrecognized audio format");
+
+    let mut format = probed.format;
+
+    // 4. Find the first valid audio track.
+    let track = format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+        .expect("No supported audio tracks found");
+
+    let track_id = track.id;
+    let sample_rate = track.codec_params.sample_rate.expect("Unknown sample rate");
+
+    // 5. Create a decoder for the track.
+    let dec_opts: DecoderOptions = Default::default();
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &dec_opts)
+        .expect("Unsupported audio codec");
+
+    let mut samples: Vec<f32> = Vec::new();
+    let mut sample_buf = None;
+
+    println!("Decoding audio and downmixing to mono...");
+    // 6. Decode all packets and downmix channels
+    loop {
+        let packet = match format.next_packet() {
+            Ok(packet) => packet,
+            Err(Error::IoError(_)) => break, // Expected End-of-file
+            Err(e) => {
+                eprintln!("Error reading packet: {}", e);
+                break;
+            }
+        };
+
+        if packet.track_id() != track_id {
+            continue; // Skip packets belonging to other tracks (e.g. video/metadata)
+        }
+
+        match decoder.decode(&packet) {
+            Ok(audio_buf) => {
+                // Get the channel count directly from the decoded buffer
+                let channel_count = audio_buf.spec().channels.count();
+
+                // Initialize the sample buffer if it hasn't been set up yet
+                if sample_buf.is_none() {
+                    let spec = *audio_buf.spec();
+                    let duration = audio_buf.capacity() as u64;
+                    sample_buf = Some(SampleBuffer::<f32>::new(duration, spec));
+                }
+
+                if let Some(buf) = &mut sample_buf {
+                    buf.copy_interleaved_ref(audio_buf);
+                    
+                    let interleaved = buf.samples();
+                    
+                    // Downmix to mono by averaging all channels for each frame
+                    for frame in interleaved.chunks_exact(channel_count) {
+                        let sum: f32 = frame.iter().sum();
+                        samples.push(sum / channel_count as f32);
+                    }
+                }
+            }
+            Err(Error::DecodeError(e)) => {
+                // A recoverable decode error (e.g., dropped frame)
+                eprintln!("Decode error: {}", e);
+            }
+            Err(e) => {
+                eprintln!("Fatal decode error: {}", e);
+                break;
+            }
+        }
+    }
 
     println!("Applying Bandpass Filter (150Hz - 1000Hz)...");
     let fs = sample_rate.hz();
